@@ -36,6 +36,24 @@ runomp: run.c
 	$(CC) -Ofast -fopenmp -march=native run.c  -lm  -o run
 	$(CC) -Ofast -fopenmp -march=native runq.c  -lm  -o runq
 
+# Compiles with MKL support, requires an MKL installation
+MKLROOT=/opt/intel/oneapi/mkl/latest
+
+.PHONY: runmkl
+runmkl: run.c
+	gcc -DMKL -march=native -O3 -o run run.c -m64 -I${MKLROOT}/include -Wl,--start-group ${MKLROOT}/lib/libmkl_intel_lp64.a ${MKLROOT}/lib/libmkl_gnu_thread.a ${MKLROOT}/lib/libmkl_core.a -Wl,--end-group -lgomp -lpthread -lm -ldl
+
+
+# Compiles with CUDA support, requires a CUDA installation
+.PHONY: runcuda_naive_allocation
+runcuda_naive_allocation: run_naive_allocation.cu
+	nvcc -O3 -o run run_naive_allocation.cu matmul.cu -lm -ldl -lcublas
+
+.PHONY: runcuda
+runcuda: run.cu
+	nvcc -O3 -o run run.cu matmul.cu -lm -ldl -lcublas
+	# --use_fast_math -Xcompiler
+
 .PHONY: win64
 win64:
 	x86_64-w64-mingw32-gcc -Ofast -D_WIN32 -o run.exe -I. run.c win.c

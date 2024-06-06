@@ -1,4 +1,4 @@
-/* Inference for Llama-2 Transformer model in pure C */
+/* Inference for Llama-2 Transformer model in C with matmul cuda kernel */
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -13,9 +13,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
-#ifdef MKL
-#include <mkl.h>
-#endif // MKL
+#include "matmul.hpp"
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -81,16 +79,18 @@ typedef struct {
 void malloc_run_state(RunState *s, Config *p) {
   // we calloc instead of malloc to keep valgrind happy
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  s->x = calloc(p->dim, sizeof(float));
-  s->xb = calloc(p->dim, sizeof(float));
-  s->xb2 = calloc(p->dim, sizeof(float));
-  s->hb = calloc(p->hidden_dim, sizeof(float));
-  s->hb2 = calloc(p->hidden_dim, sizeof(float));
-  s->q = calloc(p->dim, sizeof(float));
-  s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-  s->logits = calloc(p->vocab_size, sizeof(float));
+  s->x = (float *)calloc(p->dim, sizeof(float));
+  s->xb = (float *)calloc(p->dim, sizeof(float));
+  s->xb2 = (float *)calloc(p->dim, sizeof(float));
+  s->hb = (float *)calloc(p->hidden_dim, sizeof(float));
+  s->hb2 = (float *)calloc(p->hidden_dim, sizeof(float));
+  s->q = (float *)calloc(p->dim, sizeof(float));
+  s->key_cache =
+      (float *)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+  s->value_cache =
+      (float *)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+  s->att = (float *)calloc(p->n_heads * p->seq_len, sizeof(float));
+  s->logits = (float *)calloc(p->vocab_size, sizeof(float));
   // ensure all mallocs went fine
   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
       !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -172,7 +172,7 @@ void read_checkpoint(char *checkpoint, Config *config,
     fprintf(stderr, "open failed!\n");
     exit(EXIT_FAILURE);
   }
-  *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+  *data = (float *)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
   if (*data == MAP_FAILED) {
     fprintf(stderr, "mmap failed!\n");
     exit(EXIT_FAILURE);
@@ -239,32 +239,53 @@ void softmax(float *x, int size) {
   }
 }
 
+struct CublasHandleManager {
+  cublasHandle_t handle;
+  // Initialize cuBLAS handle
+  CublasHandleManager() {
+    cublasCreate(&handle);
+    cublasMath_t cublas_math_mode = CUBLAS_TF32_TENSOR_OP_MATH;
+    // cublasMath_t cublas_math_mode = CUBLAS_DEFAULT_MATH;
+    cublasSetMathMode(handle, cublas_math_mode);
+  }
+  // Destroy cuBLAS handle
+  ~CublasHandleManager() { cublasDestroy(handle); }
+  // Get cuBLAS handle
+  cublasHandle_t get() { return handle; }
+} cublas_handle_manager;
+
 void matmul(float *xout, float *x, float *w, int n, int d) {
-// W (d,n) @ x (n,) -> xout (d,)
-// by far the most amount of time is spent inside this little function
-#ifdef MKL
+  // W (d,n) @ x (n,) -> xout (d,)
+  // by far the most amount of time is spent inside this little function
   int m = d;
   int k = n;
   n = 1;
 
-  int lda = k;
-  int ldb = n;
-  int ldc = n;
+  // Allocate device memory
+  float *d_w, *d_x, *d_xout;
+  cudaMalloc(&d_w, m * k * sizeof(float));
+  cudaMalloc(&d_x, k * n * sizeof(float));
+  cudaMalloc(&d_xout, m * n * sizeof(float));
 
-  // mkl_set_num_threads(mkl_get_max_threads());
-  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, w, lda,
-              x, ldb, 0.0f, xout, ldc);
-#else
-  int i;
-#pragma omp parallel for private(i)
-  for (i = 0; i < d; i++) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      val += w[i * n + j] * x[j];
-    }
-    xout[i] = val;
-  }
-#endif // MKL
+  // Transfer data to device
+  cudaMemcpy(d_w, w, m * k * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_x, x, k * n * sizeof(float), cudaMemcpyHostToDevice);
+
+  // Perform matrix multiplication
+  // cuda_kernels::mmult_naive(d_xout, d_w, d_x, m, k, n);
+  cuda_kernels::mmult_cublas(cublas_handle_manager.get(), d_xout, d_w, d_x, m,
+                             k, n);
+
+  // Sync device
+  cudaDeviceSynchronize();
+
+  // Transfer data back to host
+  cudaMemcpy(xout, d_xout, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Free device memory
+  cudaFree(d_w);
+  cudaFree(d_x);
+  cudaFree(d_xout);
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
@@ -515,8 +536,8 @@ int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
   // efficiently find the perfect match for str in vocab, return its index or -1
   // if not found
   TokenIndex tok = {.str = str}; // acts as the key to search for
-  TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex),
-                            compare_tokens);
+  TokenIndex *res = (TokenIndex *)bsearch(&tok, sorted_vocab, vocab_size,
+                                          sizeof(TokenIndex), compare_tokens);
   return res != NULL ? res->id : -1;
 }
 
@@ -532,7 +553,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
 
   if (t->sorted_vocab == NULL) {
     // lazily malloc and sort the vocabulary
-    t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+    t->sorted_vocab = (TokenIndex *)malloc(t->vocab_size * sizeof(TokenIndex));
     for (int i = 0; i < t->vocab_size; i++) {
       t->sorted_vocab[i].str = t->vocab[i];
       t->sorted_vocab[i].id = i;
@@ -543,7 +564,8 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
   // create a temporary buffer that will store merge candidates of always two
   // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
   // case max_token_length is 1)
-  char *str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+  char *str_buffer =
+      (char *)malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
   size_t str_len = 0;
 
   // start at 0 tokens
@@ -559,7 +581,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
   // the energy to read more of the sentencepiece code to figure out what it's
   // doing
   if (text[0] != '\0') {
-    int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+    int dummy_prefix = str_lookup((char *)" ", t->sorted_vocab, t->vocab_size);
     tokens[(*n_tokens)++] = dummy_prefix;
   }
 
@@ -758,7 +780,8 @@ void build_sampler(Sampler *sampler, int vocab_size, float temperature,
   sampler->topp = topp;
   sampler->rng_state = rng_seed;
   // buffer only used with nucleus sampling; may not need but it's ~small
-  sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+  sampler->probindex =
+      (ProbIndex *)malloc(sampler->vocab_size * sizeof(ProbIndex));
 }
 
 void free_sampler(Sampler *sampler) { free(sampler->probindex); }
@@ -817,7 +840,7 @@ long time_in_ms() {
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
               char *prompt, int steps) {
-  char *empty_prompt = "";
+  char *empty_prompt = (char *)"";
   if (prompt == NULL) {
     prompt = empty_prompt;
   }
@@ -917,7 +940,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   int8_t user_turn = 1; // user starts
   int next;             // will store the next token in the sequence
   int token;            // stores the current token to feed into the transformer
-  int prev_token;
+  // int prev_token;
   int pos = 0; // position in the sequence
   while (pos < steps) {
 
@@ -1018,7 +1041,7 @@ int main(int argc, char *argv[]) {
 
   // default parameters
   char *checkpoint_path = NULL; // e.g. out/model.bin
-  char *tokenizer_path = "tokenizer.bin";
+  char *tokenizer_path = (char *)"tokenizer.bin";
   float temperature =
       1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
   float topp =
@@ -1026,7 +1049,7 @@ int main(int argc, char *argv[]) {
   int steps = 256;                 // number of steps to run for
   char *prompt = NULL;             // prompt string
   unsigned long long rng_seed = 0; // seed rng with time by default
-  char *mode = "generate";         // generate|chat
+  char *mode = (char *)"generate"; // generate|chat
   char *system_prompt =
       NULL; // the (optional) system prompt to use in chat mode
 

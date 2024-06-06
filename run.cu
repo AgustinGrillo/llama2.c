@@ -1,4 +1,4 @@
-/* Inference for Llama-2 Transformer model in pure C */
+/* Inference for Llama-2 Transformer model in C with matmul cuda kernel */
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -13,9 +13,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
-#ifdef MKL
-#include <mkl.h>
-#endif // MKL
+#include "matmul.hpp"
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -81,16 +79,18 @@ typedef struct {
 void malloc_run_state(RunState *s, Config *p) {
   // we calloc instead of malloc to keep valgrind happy
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  s->x = calloc(p->dim, sizeof(float));
-  s->xb = calloc(p->dim, sizeof(float));
-  s->xb2 = calloc(p->dim, sizeof(float));
-  s->hb = calloc(p->hidden_dim, sizeof(float));
-  s->hb2 = calloc(p->hidden_dim, sizeof(float));
-  s->q = calloc(p->dim, sizeof(float));
-  s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-  s->logits = calloc(p->vocab_size, sizeof(float));
+  s->x = (float *)calloc(p->dim, sizeof(float));
+  s->xb = (float *)calloc(p->dim, sizeof(float));
+  s->xb2 = (float *)calloc(p->dim, sizeof(float));
+  s->hb = (float *)calloc(p->hidden_dim, sizeof(float));
+  s->hb2 = (float *)calloc(p->hidden_dim, sizeof(float));
+  s->q = (float *)calloc(p->dim, sizeof(float));
+  s->key_cache =
+      (float *)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+  s->value_cache =
+      (float *)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+  s->att = (float *)calloc(p->n_heads * p->seq_len, sizeof(float));
+  s->logits = (float *)calloc(p->vocab_size, sizeof(float));
   // ensure all mallocs went fine
   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
       !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -172,7 +172,7 @@ void read_checkpoint(char *checkpoint, Config *config,
     fprintf(stderr, "open failed!\n");
     exit(EXIT_FAILURE);
   }
-  *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+  *data = (float *)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
   if (*data == MAP_FAILED) {
     fprintf(stderr, "mmap failed!\n");
     exit(EXIT_FAILURE);
@@ -239,32 +239,83 @@ void softmax(float *x, int size) {
   }
 }
 
+struct CublasHandleManager {
+  cublasHandle_t handle;
+  // Initialize cuBLAS handle
+  CublasHandleManager() {
+    cublasCreate(&handle);
+    cublasMath_t cublas_math_mode = CUBLAS_TF32_TENSOR_OP_MATH;
+    // cublasMath_t cublas_math_mode = CUBLAS_DEFAULT_MATH;
+    cublasSetMathMode(handle, cublas_math_mode);
+  }
+  // Destroy cuBLAS handle
+  ~CublasHandleManager() { cublasDestroy(handle); }
+  // Get cuBLAS handle
+  cublasHandle_t get() { return handle; }
+} cublas_handle_manager;
+
 void matmul(float *xout, float *x, float *w, int n, int d) {
-// W (d,n) @ x (n,) -> xout (d,)
-// by far the most amount of time is spent inside this little function
-#ifdef MKL
+  // W (d,n) @ x (n,) -> xout (d,)
+  // by far the most amount of time is spent inside this little function
   int m = d;
   int k = n;
   n = 1;
 
-  int lda = k;
-  int ldb = n;
-  int ldc = n;
+  // Allocate device memory (if not already allocated)
+  cudaPointerAttributes xout_attr, x_attr, w_attr;
+  cudaPointerGetAttributes(&xout_attr, xout);
+  cudaPointerGetAttributes(&x_attr, x);
+  cudaPointerGetAttributes(&w_attr, w);
 
-  // mkl_set_num_threads(mkl_get_max_threads());
-  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, w, lda,
-              x, ldb, 0.0f, xout, ldc);
-#else
-  int i;
-#pragma omp parallel for private(i)
-  for (i = 0; i < d; i++) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      val += w[i * n + j] * x[j];
-    }
-    xout[i] = val;
+  float *d_w, *d_x, *d_xout;
+  if (xout_attr.type != cudaMemoryTypeHost) {
+    // Allocate device memory
+    cudaMalloc(&d_xout, m * n * sizeof(float));
+  } else {
+    d_xout = xout;
   }
-#endif // MKL
+  if (x_attr.type != cudaMemoryTypeHost) {
+    // Allocate device memory
+    cudaMalloc(&d_x, k * n * sizeof(float));
+    // Transfer data to device
+    cudaMemcpy(d_x, x, k * n * sizeof(float), cudaMemcpyHostToDevice);
+  } else {
+    d_x = x;
+  }
+  if (w_attr.type != cudaMemoryTypeHost) {
+    // Allocate device memory
+    cudaMalloc(&d_w, m * k * sizeof(float));
+    // Transfer data to device
+    cudaMemcpy(d_w, w, m * k * sizeof(float), cudaMemcpyHostToDevice);
+  } else {
+    d_w = w;
+  }
+
+  // Perform matrix multiplication
+  // cuda_kernels::mmult_naive(d_xout, d_w, d_x, m, k, n);
+  cuda_kernels::mmult_cublas(cublas_handle_manager.get(), d_xout, d_w, d_x, m,
+                             k, n);
+
+  // Sync device
+  cudaDeviceSynchronize();
+
+  // Free and Transfer data back to host (if necessary)
+  if (xout_attr.type != cudaMemoryTypeHost) {
+    // Transfer data back to host
+    cudaMemcpy(xout, d_xout, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+    // Free device memory
+    cudaFree(d_xout);
+  } else {
+    xout = d_xout;
+  }
+  if (x_attr.type != cudaMemoryTypeHost) {
+    // Free device memory
+    cudaFree(d_x);
+  }
+  if (w_attr.type != cudaMemoryTypeHost) {
+    // Free device memory
+    cudaFree(d_w);
+  }
 }
 
 float *forward(Transformer *transformer, int token, int pos) {
@@ -302,8 +353,8 @@ float *forward(Transformer *transformer, int token, int pos) {
     matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
     matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
 
-    // RoPE relative positional encoding: complex-valued rotate q and k in each
-    // head
+    // RoPE relative positional encoding: complex-valued rotate q and k in
+    // each head
     for (int i = 0; i < dim; i += 2) {
       int head_dim = i % head_size;
       float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -373,8 +424,8 @@ float *forward(Transformer *transformer, int token, int pos) {
     // ffn rmsnorm
     rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
 
-    // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-    // first calculate self.w1(x) and self.w3(x)
+    // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) *
+    // self.w3(x)) first calculate self.w1(x) and self.w3(x)
     matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
     matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
 
@@ -493,9 +544,9 @@ char *decode(Tokenizer *t, int prev_token, int token) {
 }
 
 void safe_printf(char *piece) {
-  // piece might be a raw byte token, and we only want to print printable chars
-  // or whitespace because some of the other bytes can be various control codes,
-  // backspace, etc.
+  // piece might be a raw byte token, and we only want to print printable
+  // chars or whitespace because some of the other bytes can be various
+  // control codes, backspace, etc.
   if (piece == NULL) {
     return;
   }
@@ -512,19 +563,19 @@ void safe_printf(char *piece) {
 }
 
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
-  // efficiently find the perfect match for str in vocab, return its index or -1
-  // if not found
+  // efficiently find the perfect match for str in vocab, return its index or
+  // -1 if not found
   TokenIndex tok = {.str = str}; // acts as the key to search for
-  TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex),
-                            compare_tokens);
+  TokenIndex *res = (TokenIndex *)bsearch(&tok, sorted_vocab, vocab_size,
+                                          sizeof(TokenIndex), compare_tokens);
   return res != NULL ? res->id : -1;
 }
 
 void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
             int *n_tokens) {
   // encode the string text (input) into an upper-bound preallocated tokens[]
-  // array bos != 0 means prepend the BOS token (=1), eos != 0 means append the
-  // EOS token (=2)
+  // array bos != 0 means prepend the BOS token (=1), eos != 0 means append
+  // the EOS token (=2)
   if (text == NULL) {
     fprintf(stderr, "cannot encode NULL text\n");
     exit(EXIT_FAILURE);
@@ -532,7 +583,7 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
 
   if (t->sorted_vocab == NULL) {
     // lazily malloc and sort the vocabulary
-    t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+    t->sorted_vocab = (TokenIndex *)malloc(t->vocab_size * sizeof(TokenIndex));
     for (int i = 0; i < t->vocab_size; i++) {
       t->sorted_vocab[i].str = t->vocab[i];
       t->sorted_vocab[i].id = i;
@@ -543,7 +594,8 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
   // create a temporary buffer that will store merge candidates of always two
   // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
   // case max_token_length is 1)
-  char *str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+  char *str_buffer =
+      (char *)malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
   size_t str_len = 0;
 
   // start at 0 tokens
@@ -554,19 +606,19 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
     tokens[(*n_tokens)++] = 1;
 
   // add_dummy_prefix is true by default
-  // so prepend a dummy prefix token to the input string, but only if text != ""
+  // so prepend a dummy prefix token to the input string, but only if text !=
+  // ""
   // TODO: pretty sure this isn't correct in the general case but I don't have
   // the energy to read more of the sentencepiece code to figure out what it's
   // doing
   if (text[0] != '\0') {
-    int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+    int dummy_prefix = str_lookup((char *)" ", t->sorted_vocab, t->vocab_size);
     tokens[(*n_tokens)++] = dummy_prefix;
   }
 
-  // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
-  // Code point ↔ UTF-8 conversion
-  // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
-  // U+0000	U+007F	    0xxxxxxx
+  // Okay UTF-8 time. This will get messy. Here is the reference from
+  // Wikipedia: Code point ↔ UTF-8 conversion First code point	Last
+  // code point	Byte 1	Byte 2	Byte 3	Byte 4 U+0000	U+007F 0xxxxxxx
   // U+0080	U+07FF	    110xxxxx	10xxxxxx
   // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
   // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
@@ -576,9 +628,9 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
 
     // reset buffer if the current byte is ASCII or a leading byte
     // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the
-    // rest 0x80 is 10000000 in UTF-8, all continuation bytes start with "10" in
-    // first two bits so in English this is: "if this byte is not a continuation
-    // byte"
+    // rest 0x80 is 10000000 in UTF-8, all continuation bytes start with "10"
+    // in first two bits so in English this is: "if this byte is not a
+    // continuation byte"
     if ((*c & 0xC0) != 0x80) {
       // this byte must be either a leading byte (11...) or an ASCII char
       // (0x...)
@@ -638,7 +690,8 @@ void encode(Tokenizer *t, char *text, int8_t bos, int8_t eos, int *tokens,
       break; // we couldn't find any more pairs to merge, so we're done
     }
 
-    // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
+    // merge the consecutive pair (best_idx, best_idx+1) into new token
+    // best_id
     tokens[best_idx] = best_id;
     // delete token at position best_idx+1, shift the entire sequence back 1
     for (int i = best_idx + 1; i < (*n_tokens - 1); i++) {
@@ -758,7 +811,8 @@ void build_sampler(Sampler *sampler, int vocab_size, float temperature,
   sampler->topp = topp;
   sampler->rng_state = rng_seed;
   // buffer only used with nucleus sampling; may not need but it's ~small
-  sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+  sampler->probindex =
+      (ProbIndex *)malloc(sampler->vocab_size * sizeof(ProbIndex));
 }
 
 void free_sampler(Sampler *sampler) { free(sampler->probindex); }
@@ -817,7 +871,7 @@ long time_in_ms() {
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
               char *prompt, int steps) {
-  char *empty_prompt = "";
+  char *empty_prompt = (char *)"";
   if (prompt == NULL) {
     prompt = empty_prompt;
   }
@@ -917,7 +971,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
   int8_t user_turn = 1; // user starts
   int next;             // will store the next token in the sequence
   int token;            // stores the current token to feed into the transformer
-  int prev_token;
+  // int prev_token;
   int pos = 0; // position in the sequence
   while (pos < steps) {
 
@@ -1018,15 +1072,15 @@ int main(int argc, char *argv[]) {
 
   // default parameters
   char *checkpoint_path = NULL; // e.g. out/model.bin
-  char *tokenizer_path = "tokenizer.bin";
+  char *tokenizer_path = (char *)"tokenizer.bin";
   float temperature =
       1.0f; // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-  float topp =
-      0.9f; // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-  int steps = 256;                 // number of steps to run for
-  char *prompt = NULL;             // prompt string
+  float topp = 0.9f;   // top-p in nucleus sampling. 1.0 = off. 0.9 works well,
+                       // but slower
+  int steps = 256;     // number of steps to run for
+  char *prompt = NULL; // prompt string
   unsigned long long rng_seed = 0; // seed rng with time by default
-  char *mode = "generate";         // generate|chat
+  char *mode = (char *)"generate"; // generate|chat
   char *system_prompt =
       NULL; // the (optional) system prompt to use in chat mode
 
