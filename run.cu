@@ -50,6 +50,13 @@ typedef struct {
 } TransformerWeights;
 
 typedef struct {
+  float *wq; // (layer, dim, n_heads * head_size)
+  float *wk; // (layer, dim, n_kv_heads * head_size)
+  float *wv; // (layer, dim, n_kv_heads * head_size)
+
+} CudaSpecificTransformerWeights;
+
+typedef struct {
   // current wave of activations
   float *x;      // activation at current time stamp (dim,)
   float *xb;     // same, but inside a residual branch (dim,)
@@ -69,6 +76,7 @@ typedef struct {
 typedef struct {
   Config config; // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
+  CudaSpecificTransformerWeights cuda_weights;
   RunState state; // buffers for the "wave" of activations in the forward pass
   // some more state needed to properly clean up the memory mapping (sigh)
   int fd;            // file descriptor for memory mapping
@@ -112,8 +120,9 @@ void free_run_state(RunState *s) {
   free(s->value_cache);
 }
 
-void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
-                        int shared_weights) {
+void memory_map_weights(TransformerWeights *w,
+                        CudaSpecificTransformerWeights *cw, Config *p,
+                        float *ptr, int shared_weights) {
   int head_size = p->dim / p->n_heads;
   // make sure the multiplications below are done in 64bit to fit the parameter
   // counts of 13B+ models
@@ -145,11 +154,32 @@ void memory_map_weights(TransformerWeights *w, Config *p, float *ptr,
   ptr += p->seq_len * head_size /
          2; // skip what used to be freq_cis_imag (for RoPE)
   w->wcls = shared_weights ? w->token_embedding_table : ptr;
+
+  // Cuda allocations
+  // Wq
+  cudaMalloc(&cw->wq,
+             n_layers * p->dim * (p->n_heads * head_size) * sizeof(float));
+  cudaMemcpy(cw->wq, w->wq,
+             n_layers * p->dim * (p->n_heads * head_size) * sizeof(float),
+             cudaMemcpyHostToDevice);
+  // Wk
+  cudaMalloc(&cw->wk,
+             n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float));
+  cudaMemcpy(cw->wk, w->wk,
+             n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float),
+             cudaMemcpyHostToDevice);
+  // Wv
+  cudaMalloc(&cw->wv,
+             n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float));
+  cudaMemcpy(cw->wv, w->wv,
+             n_layers * p->dim * (p->n_kv_heads * head_size) * sizeof(float),
+             cudaMemcpyHostToDevice);
 }
 
 void read_checkpoint(char *checkpoint, Config *config,
-                     TransformerWeights *weights, int *fd, float **data,
-                     ssize_t *file_size) {
+                     TransformerWeights *weights,
+                     CudaSpecificTransformerWeights *cuda_weights, int *fd,
+                     float **data, ssize_t *file_size) {
   FILE *file = fopen(checkpoint, "rb");
   if (!file) {
     fprintf(stderr, "Couldn't open file %s\n", checkpoint);
@@ -178,13 +208,14 @@ void read_checkpoint(char *checkpoint, Config *config,
     exit(EXIT_FAILURE);
   }
   float *weights_ptr = *data + sizeof(Config) / sizeof(float);
-  memory_map_weights(weights, config, weights_ptr, shared_weights);
+  memory_map_weights(weights, cuda_weights, config, weights_ptr,
+                     shared_weights);
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path) {
   // read in the Config and the Weights from the checkpoint
-  read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data,
-                  &t->file_size);
+  read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->cuda_weights,
+                  &t->fd, &t->data, &t->file_size);
   // allocate the RunState buffers
   malloc_run_state(&t->state, &t->config);
 }
@@ -323,6 +354,7 @@ float *forward(Transformer *transformer, int token, int pos) {
   // a few convenience variables
   Config *p = &transformer->config;
   TransformerWeights *w = &transformer->weights;
+  CudaSpecificTransformerWeights *cw = &transformer->cuda_weights;
   RunState *s = &transformer->state;
   float *x = s->x;
   int dim = p->dim;
@@ -349,9 +381,13 @@ float *forward(Transformer *transformer, int token, int pos) {
     s->v = s->value_cache + loff + pos * kv_dim;
 
     // qkv matmuls for this position
-    matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
-    matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
-    matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+    // NOTE: cuda matmul
+    // matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
+    matmul(s->q, s->xb, cw->wq + l * dim * dim, dim, dim);
+    // matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
+    matmul(s->k, s->xb, cw->wk + l * dim * kv_dim, dim, kv_dim);
+    // matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+    matmul(s->v, s->xb, cw->wv + l * dim * kv_dim, dim, kv_dim);
 
     // RoPE relative positional encoding: complex-valued rotate q and k in
     // each head
