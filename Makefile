@@ -41,7 +41,7 @@ MKLROOT=/opt/intel/oneapi/mkl/latest
 
 .PHONY: runmkl
 runmkl: run.c
-	gcc -DMKL -march=native -O3 -o run run.c -m64 -I${MKLROOT}/include -Wl,--start-group ${MKLROOT}/lib/libmkl_intel_lp64.a ${MKLROOT}/lib/libmkl_gnu_thread.a ${MKLROOT}/lib/libmkl_core.a -Wl,--end-group -lgomp -lpthread -lm -ldl
+	gcc -DMKL -Ofast -fopenmp -march=native -o run run.c -m64 -I${MKLROOT}/include -Wl,--start-group ${MKLROOT}/lib/libmkl_intel_lp64.a ${MKLROOT}/lib/libmkl_gnu_thread.a ${MKLROOT}/lib/libmkl_core.a -Wl,--end-group -lgomp -lpthread -lm -ldl
 
 
 # Compiles with CUDA support, requires a CUDA installation
