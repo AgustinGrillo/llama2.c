@@ -49,9 +49,18 @@ runmkl: run.c
 runcuda_naive_allocation: run_naive_allocation.cu
 	nvcc -O3 -o run run_naive_allocation.cu matmul.cu -lm -ldl -lcublas
 
+# .PHONY: runcuda
+# runcuda: run.cu
+# 	nvcc -O3 -o run run.cu matmul.cu -lm -ldl -lcublas
+# 	# --use_fast_math -Xcompiler
+
 .PHONY: runcuda
-runcuda: run.cu
-	nvcc -O3 -o run run.cu matmul.cu -lm -ldl -lcublas
+runcuda: matmul.o
+	g++ -Ofast -fopenmp -I/usr/local/cuda/include/ run_cuda.cpp matmul.o -o run -L/usr/local/cuda/lib64 -lm -ldl -lcuda -lcudart -lcublas  
+
+.PHONY: matmul.o
+matmul.o:
+	nvcc -O3 -c matmul.cu -lm -ldl -lcublas
 	# --use_fast_math -Xcompiler
 
 .PHONY: win64
