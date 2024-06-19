@@ -36,6 +36,10 @@ runomp: run.c
 	$(CC) -Ofast -fopenmp -march=native run.c  -lm  -o run
 	$(CC) -Ofast -fopenmp -march=native runq.c  -lm  -o runq
 
+.PHONY: runprints
+runprints: run_prints.c
+	$(CC) -O3 -o run run_prints.c -lm
+
 # Compiles with MKL support, requires an MKL installation
 MKLROOT=/opt/intel/oneapi/mkl/latest
 
